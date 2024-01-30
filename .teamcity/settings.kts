@@ -220,3 +220,189 @@ project {
         }
     }
 }
+project {
+    val settingsBranch = DslContext.getParameter("settings.branch", "master")
+    description = "Gradle plugin for developing TeamCity plugins (Settings: [${settingsBranch}])"
+
+    val settingsVcs = GitVcsRoot {
+        id("TeamcitySettings2")
+        name = "teamcity-settings2"
+        url = "https://github.com/rodm/teamcity-settings"
+    }
+    vcsRoot(settingsVcs)
+
+    features {
+        githubIssueTracker {
+            displayName = "GradleTeamCityPlugin"
+            repository = "https://github.com/rodm/gradle-teamcity-plugin"
+            pattern = """#(\d+)"""
+        }
+    }
+
+    params {
+        param("teamcity.ui.settings.readOnly", "true")
+    }
+
+    val vcs = GitVcsRoot {
+        id("GradleTeamcityPlugin")
+        name = "gradle-teamcity-plugin"
+        url = "https://github.com/rodm/gradle-teamcity-plugin.git"
+    }
+    vcsRoot(vcs)
+
+    val buildTemplate = template {
+        id("Build")
+        name = "build"
+
+        vcs {
+            root(vcs)
+        }
+
+        steps {
+            gradle {
+                id = "GRADLE_BUILD"
+                tasks = "%gradle.tasks%"
+                gradleParams = "%gradle.opts%"
+                useGradleWrapper = true
+                gradleWrapperPath = ""
+                enableStacktrace = true
+                jdkHome = "%java.home%"
+            }
+        }
+
+        failureConditions {
+            executionTimeoutMin = 10
+        }
+
+        features {
+            feature {
+                id = "perfmon"
+                type = "perfmon"
+            }
+        }
+
+        params {
+            param("gradle.tasks", "clean build")
+            param("gradle.opts", "")
+            param("java.home", "%java8.home%")
+        }
+    }
+
+    pipeline {
+        stage ("Build") {
+            build {
+                id("BuildJava8")
+                name = "Build - Java 8"
+                templates(buildTemplate)
+            }
+
+            build {
+                id("BuildJava11")
+                name = "Build - Java 11"
+                templates(buildTemplate)
+
+                params {
+                    param("java.home", "%java11.home%")
+                }
+            }
+
+            build {
+                id("ReportCodeQuality")
+                name = "Report - Code Quality"
+                templates(buildTemplate)
+                params {
+                    param("gradle.tasks", "clean build sonarqube")
+                    param("gradle.opts", "%sonar.opts%")
+                }
+
+                features {
+                    gradleInitScript {
+                        scriptName = "sonarqube.gradle"
+                    }
+                }
+            }
+        }
+        stage ("Functional tests") {
+            defaults {
+                failureConditions {
+                    executionTimeoutMin = 20
+                }
+            }
+
+            matrix {
+                axes {
+                    "Java"("8", "11", "12", "13")
+                }
+                build {
+                    val javaVersion = axes["Java"]
+                    id("FunctionalTestJava${javaVersion}")
+                    name = "Functional Test - Java ${javaVersion}"
+                    templates(buildTemplate)
+                    failureConditions {
+                        executionTimeoutMin = 20
+                    }
+                    params {
+                        param("gradle.tasks", "clean functionalTest")
+                        param("java.home", "%java${javaVersion}.home%")
+                    }
+                }
+            }
+
+            matrix {
+                axes {
+                    "Versions"("14, 6.3", "15, 6.7.1")
+                }
+                build {
+                    val versions = axes["Versions"]?.split(",")
+                    val javaVersion = versions?.get(0)?.trim()
+                    val gradleVersion = versions?.get(1)?.trim()
+
+                    id("FunctionalTestJava${javaVersion}")
+                    name = "Functional Test - Java ${javaVersion}"
+                    templates(buildTemplate)
+                    params {
+                        param("gradle.tasks", "clean functionalTest")
+                        param("gradle.version", "${gradleVersion}")
+                        param("java.home", "%java${javaVersion}.home%")
+                    }
+                    steps {
+                        switchGradleBuildStep()
+                        stepsOrder = arrayListOf("SWITCH_GRADLE", "GRADLE_BUILD")
+                    }
+                }
+            }
+
+            build {
+                id("SamplesTestJava8")
+                name = "Samples Test - Java 8"
+                templates(buildTemplate)
+                params{
+                    param("gradle.tasks", "clean samplesTest")
+                }
+            }
+        }
+
+        stage ("Publish") {
+            build {
+                id("DummyPublish")
+                name = "Publish to repository"
+                templates(buildTemplate)
+
+                params {
+                    param("gradle.tasks", "clean build publishPluginPublicationToMavenLocal")
+                }
+
+                triggers {
+                    vcs {
+                        quietPeriodMode = USE_DEFAULT
+                        branchFilter = ""
+                        triggerRules = """
+                            +:root=${DslContext.projectId.absoluteId}_TeamcitySettings;:**
+                            +:root=${DslContext.projectId.absoluteId}_GradleTeamcityPlugin:**
+                            """.trimIndent()
+                    }
+                }
+            }
+        }
+    }
+}
